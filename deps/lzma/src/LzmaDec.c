@@ -1226,6 +1226,8 @@ SRes LzmaDec_DecodeToBuf(CLzmaDec *p, Byte *dest, SizeT *destLen, const Byte *sr
     inSize -= inSizeCur;
     *srcLen += inSizeCur;
     outSizeCur = p->dicPos - dicPos;
+    if (outSizeCur > outSize)
+      return SZ_ERROR_DATA;
     memcpy(dest, p->dic + dicPos, outSizeCur);
     dest += outSizeCur;
     outSize -= outSizeCur;
