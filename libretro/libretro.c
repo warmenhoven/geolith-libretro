@@ -46,6 +46,8 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 #include "libretro.h"
 #include "libretro_core_options.h"
+#include "md5.h"
+#include "gamedb.h"
 
 // libretro-common
 #include "streams/file_stream.h"
@@ -69,10 +71,8 @@ static size_t numsamps = 0;
 // Copy of the ROM data passed in by the frontend
 static void *romdata = NULL;
 
-/* Byteswapped Main RAM -- Allow achievements which were written for emulators
-   which use host-native byte order rather than emulated system byte order.
-*/
-static uint8_t mainram_shadow[SIZE_64K];
+// ROM data verification
+static int verified = 0;
 
 // CD mode flag and system type
 static int cd_mode = 0;
@@ -268,13 +268,30 @@ static kvpair_t bindmap_vliner[] = {
     { RETRO_DEVICE_ID_JOYPAD_R3,        0x80 }, // Hopper Out
 };
 
-static void update_mainram_shadow(void) {
-    size_t sz = 0;
-    const uint8_t *src = geo_mem_ptr(GEO_MEMTYPE_MAINRAM, &sz);
-    for (size_t i = 0; i < SIZE_64K; i += 2) {
-        mainram_shadow[i] = src[i + 1];
-        mainram_shadow[i + 1] = src[i];
+// Convert a nybble's hexadecimal representation to a lower case ASCII char
+static inline char geo_nyb_hexchar(unsigned nyb) {
+    nyb &= 0xf; // Lower nybble only
+    if (nyb >= 10)
+        nyb += 'a' - 10;
+    else
+        nyb += '0';
+    return (char)nyb;
+}
+
+static void geo_hash_md5(char *md5, const void *data, size_t md5len) {
+    MD5_CTX c;
+    uint8_t *dataptr = (uint8_t*)data;
+    uint8_t digest[16];
+    MD5_Init(&c);
+    MD5_Update(&c, dataptr, md5len);
+    MD5_Final(digest, &c);
+
+    // Convert the digest to a string without dodgy calls to snprintf
+    for (size_t i = 0; i < 16; ++i) {
+        md5[i * 2] = geo_nyb_hexchar(digest[i] >> 4);
+        md5[(i * 2) + 1] = geo_nyb_hexchar(digest[i]);
     }
+    md5[32] = '\0';
 }
 
 static void geo_retro_log(int level, const char *fmt, ...) {
@@ -1207,10 +1224,6 @@ void retro_run(void) {
     // Display frame
     geo_exec();
 
-    // Byteswap the main RAM into a shadow buffer for achievements
-    if (!cd_mode)
-        update_mainram_shadow();
-
     bool update = false;
     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &update) && update) {
         check_variables(false);
@@ -1313,25 +1326,23 @@ bool retro_load_game(const struct retro_game_info *info) {
     }
     else {
         // Cartridge mode: load NEO file
-        /* Keep an internal copy of the ROM to avoid relying on the frontend
-           keeping it persistently, and to avoid altering memory controlled by
-           the frontend (portions are byteswapped or otherwise manipulated
-           inside the emulator at load time)
-        */
-        if (info->data && info->size) {
-            romdata = (void*)calloc(1, info->size);
-            if (romdata) {
-                memcpy(romdata, info->data, info->size);
-            }
-        }
-        else if (info->path) {
-            // need_fullpath is true, so load from path
+        if (info->path) { // need_fullpath is true, so load from path
             int64_t sz = 0;
             romdata = geo_retro_file_read(info->path, &sz);
             if (!romdata) {
                 log_cb(RETRO_LOG_ERROR, "Failed to read ROM: %s\n", info->path);
                 retro_unload_game();
                 return false;
+            }
+
+            // Grab the MD5 checksum and try to verify
+            char md5[33];
+            geo_hash_md5(md5, romdata, sz);
+            for (size_t i = 0; i < sizeof(gamedb_neo) / sizeof(char*); ++i) {
+                if (!strcmp(md5, gamedb_neo[i])) {
+                    verified = 1;
+                    break;
+                }
             }
 
             if (!geo_neo_load(romdata, sz)) {
@@ -1443,6 +1454,23 @@ bool retro_load_game(const struct retro_game_info *info) {
         };
         environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &cd_mmap);
     }
+    else if (verified) { // Only set up memory descriptors if ROM is known
+        static struct retro_memory_descriptor cart_descs[] = {
+            // User/System RAM: 0x100000 - 0x10ffff (64K mirrored)
+            { RETRO_MEMDESC_SYSTEM_RAM | RETRO_MEMDESC_BIGENDIAN,
+                NULL, 0, 0x100000, 0, 0, SIZE_64K, "68K RAM" },
+            // NVRAM: MVS Only
+            { RETRO_MEMDESC_SAVE_RAM | RETRO_MEMDESC_BIGENDIAN,
+                NULL, 0, 0xd00000, 0, 0, SIZE_64K, "NVRAM" },
+        };
+        cart_descs[0].ptr = (void*)geo_mem_ptr(GEO_MEMTYPE_MAINRAM, NULL);
+        cart_descs[1].ptr = (void*)geo_mem_ptr(GEO_MEMTYPE_NVRAM, NULL);
+
+        struct retro_memory_map cart_mmap = {
+            cart_descs, sizeof(cart_descs) / sizeof(cart_descs[0])
+        };
+        environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &cart_mmap);
+    }
 
     return true;
 }
@@ -1474,6 +1502,8 @@ void retro_unload_game(void) {
         free(romdata);
 
     geo_bios_unload();
+
+    verified = 0;
 }
 
 unsigned retro_get_region(void) {
@@ -1512,7 +1542,7 @@ void *retro_get_memory_data(unsigned id) {
             return NULL;
         }
         case RETRO_MEMORY_SYSTEM_RAM: {
-            return (void*)mainram_shadow;
+            return (void*)geo_mem_ptr(GEO_MEMTYPE_MAINRAM, NULL);
         }
         case RETRO_MEMORY_VIDEO_RAM: {
             return (void*)geo_mem_ptr(GEO_MEMTYPE_VRAM, NULL);
@@ -1533,7 +1563,7 @@ size_t retro_get_memory_size(unsigned id) {
             return 0;
         }
         case RETRO_MEMORY_SYSTEM_RAM: {
-            sz = SIZE_64K;
+            mem = (void*)geo_mem_ptr(GEO_MEMTYPE_MAINRAM, &sz);
             break;
         }
         case RETRO_MEMORY_VIDEO_RAM: {

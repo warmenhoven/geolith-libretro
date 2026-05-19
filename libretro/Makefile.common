@@ -12,6 +12,7 @@ FLAGS += -DHAVE_ZLIB -DHAVE_7ZIP -DHAVE_DR_FLAC -DHAVE_FLAC -DHAVE_ZSTD \
 
 SOURCES_C := \
 	$(CORE_DIR)/libretro/libretro.c \
+	$(CORE_DIR)/libretro/md5.c \
 	$(CORE_DIR)/deps/libretro-common/compat/compat_posix_string.c \
 	$(CORE_DIR)/deps/libretro-common/compat/compat_strl.c \
 	$(CORE_DIR)/deps/libretro-common/compat/fopen_utf8.c \
